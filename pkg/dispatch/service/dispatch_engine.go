@@ -22,12 +22,12 @@ import (
 // Swap the dispatch backend by providing a different implementation at main.go wiring.
 type DispatchEngine interface {
 	Dispatch(
-		ctx            context.Context,
-		contactID      int64,
+		ctx context.Context,
+		contactID int64,
 		conversationID int64,
-		content        string,
-		cfg            model.BotConfig,
-		postbackURL    string,
+		content string,
+		cfg model.BotConfig,
+		postbackURL string,
 	) error
 }
 
@@ -66,12 +66,12 @@ func NewDispatchEngine(secret string) DispatchEngine {
 }
 
 func (d *dispatchEngineImpl) Dispatch(
-	ctx            context.Context,
-	contactID      int64,
+	ctx context.Context,
+	contactID int64,
 	conversationID int64,
-	content        string,
-	cfg            model.BotConfig,
-	postbackURL    string,
+	content string,
+	cfg model.BotConfig,
+	postbackURL string,
 ) error {
 	// Pull media URLs out of the full response BEFORE segmenting, so media is
 	// not split across text parts. Media is delivered in a single dedicated
@@ -99,9 +99,9 @@ func (d *dispatchEngineImpl) Dispatch(
 		select {
 		case <-ctx.Done():
 			slog.Info("pipeline.dispatch.interrupted",
-				"contact_id",      contactID,
+				"contact_id", contactID,
 				"conversation_id", conversationID,
-				"parts_sent",      i,
+				"parts_sent", i,
 			)
 			return brtErrors.ErrDispatchInterrupted
 		default:
@@ -117,9 +117,9 @@ func (d *dispatchEngineImpl) Dispatch(
 			select {
 			case <-ctx.Done():
 				slog.Info("pipeline.dispatch.interrupted",
-					"contact_id",      contactID,
+					"contact_id", contactID,
 					"conversation_id", conversationID,
-					"parts_sent",      i+1,
+					"parts_sent", i+1,
 				)
 				return brtErrors.ErrDispatchInterrupted
 			case <-time.After(delayMs):
@@ -140,11 +140,11 @@ func (d *dispatchEngineImpl) Dispatch(
 	}
 
 	slog.Info("pipeline.dispatch.completed",
-		"contact_id",      contactID,
+		"contact_id", contactID,
 		"conversation_id", conversationID,
-		"duration_ms",     time.Since(start).Milliseconds(),
-		"parts_total",     len(parts),
-		"attachments",     len(atts),
+		"duration_ms", time.Since(start).Milliseconds(),
+		"parts_total", len(parts),
+		"attachments", len(atts),
 	)
 	return nil
 }
@@ -184,50 +184,36 @@ func (d *dispatchEngineImpl) sendPart(ctx context.Context, postbackURL, content 
 	return nil
 }
 
-// segmentContent splits content into parts of at most TextSegmentationLimit characters,
-// respecting word boundaries, then merges any part shorter than TextSegmentationMinSize
-// with its predecessor.
+// segmentContent splits a reply into WhatsApp-sized messages.
+//
+// Paragraph mode (INOVE fork): every paragraph (text separated by a blank line)
+// becomes its own message, and line breaks inside a paragraph are preserved.
+// A paragraph longer than TextSegmentationLimit is packed line by line, then
+// sentence by sentence, and only as a last resort word by word, so a message is
+// never cut in the middle of a sentence unless the sentence alone is too long.
+// Parts shorter than TextSegmentationMinSize are merged into the previous part
+// when the result stays within the limit.
 func segmentContent(content string, cfg model.BotConfig) []string {
 	if !cfg.TextSegmentationEnabled || cfg.TextSegmentationLimit <= 0 {
 		return []string{content}
 	}
-
 	limit := cfg.TextSegmentationLimit
-	words := strings.Fields(content)
-	if len(words) == 0 {
+
+	var rawParts []string
+	for _, para := range paragraphSplit.Split(strings.ReplaceAll(content, "\r\n", "\n"), -1) {
+		para = strings.TrimSpace(para)
+		if para == "" {
+			continue
+		}
+		rawParts = append(rawParts, splitParagraph(para, limit)...)
+	}
+	if len(rawParts) == 0 {
 		return []string{content} // preserve empty or whitespace-only content
 	}
 
-	// Build raw parts greedily by word (rune-aware — fixes non-ASCII content)
-	var rawParts []string
-	var current strings.Builder
-	currentRunes := 0
-	for _, word := range words {
-		wordRunes := utf8.RuneCountInString(word)
-		if currentRunes == 0 {
-			current.WriteString(word)
-			currentRunes = wordRunes
-		} else if currentRunes+1+wordRunes <= limit {
-			current.WriteByte(' ')
-			current.WriteString(word)
-			currentRunes += 1 + wordRunes
-		} else {
-			rawParts = append(rawParts, current.String())
-			current.Reset()
-			current.WriteString(word)
-			currentRunes = wordRunes
-		}
-	}
-	if currentRunes > 0 {
-		rawParts = append(rawParts, current.String())
-	}
-
-	// Merge parts shorter than TextSegmentationMinSize into previous part,
-	// only when the merged result stays within limit (prevents overflow).
 	if cfg.TextSegmentationMinSize <= 0 || len(rawParts) <= 1 {
 		return rawParts
 	}
-
 	merged := make([]string, 0, len(rawParts))
 	lastPartRunes := 0
 	for _, p := range rawParts {
@@ -241,6 +227,83 @@ func segmentContent(content string, cfg model.BotConfig) []string {
 		}
 	}
 	return merged
+}
+
+var (
+	paragraphSplit = regexp.MustCompile(`\n[ \t]*\n\s*`)
+	sentenceEnd    = regexp.MustCompile(`[.!?…]+["')\]]*\s+`)
+)
+
+// splitParagraph keeps a paragraph whole when it fits; otherwise packs its
+// lines (joined by newline), splitting an oversized line into sentences and,
+// as a last resort, words (joined by space).
+func splitParagraph(para string, limit int) []string {
+	if utf8.RuneCountInString(para) <= limit {
+		return []string{para}
+	}
+	var lineParts []string
+	for _, line := range strings.Split(para, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if utf8.RuneCountInString(line) <= limit {
+			lineParts = append(lineParts, line)
+			continue
+		}
+		var units []string
+		for _, sent := range splitSentences(line) {
+			if utf8.RuneCountInString(sent) <= limit {
+				units = append(units, sent)
+			} else {
+				units = append(units, pack(strings.Fields(sent), limit, " ")...)
+			}
+		}
+		lineParts = append(lineParts, pack(units, limit, " ")...)
+	}
+	return pack(lineParts, limit, "\n")
+}
+
+// pack greedily joins units with sep while staying within limit runes.
+func pack(units []string, limit int, sep string) []string {
+	var out []string
+	var cur strings.Builder
+	curRunes := 0
+	sepRunes := utf8.RuneCountInString(sep)
+	for _, u := range units {
+		uRunes := utf8.RuneCountInString(u)
+		if curRunes > 0 && curRunes+sepRunes+uRunes <= limit {
+			cur.WriteString(sep)
+			cur.WriteString(u)
+			curRunes += sepRunes + uRunes
+			continue
+		}
+		if curRunes > 0 {
+			out = append(out, cur.String())
+			cur.Reset()
+		}
+		cur.WriteString(u)
+		curRunes = uRunes
+	}
+	if curRunes > 0 {
+		out = append(out, cur.String())
+	}
+	return out
+}
+
+func splitSentences(line string) []string {
+	var out []string
+	last := 0
+	for _, m := range sentenceEnd.FindAllStringIndex(line, -1) {
+		if s := strings.TrimSpace(line[last:m[1]]); s != "" {
+			out = append(out, s)
+		}
+		last = m[1]
+	}
+	if s := strings.TrimSpace(line[last:]); s != "" {
+		out = append(out, s)
+	}
+	return out
 }
 
 // --- Media URL detection ---------------------------------------------------

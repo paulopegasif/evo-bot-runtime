@@ -279,3 +279,40 @@ func TestDispatch_ValidatesPostBody(t *testing.T) {
 		t.Errorf("received.ContentType = %q, want %q", received.ContentType, "text")
 	}
 }
+
+func dispatchParts(t *testing.T, content string, cfg model.BotConfig) []string {
+	t.Helper()
+	server, partsPtr, mu := collectParts(t)
+	if err := service.NewDispatchEngine("").Dispatch(context.Background(), 9, 9, content, cfg, server.URL); err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return append([]string(nil), (*partsPtr)...)
+}
+
+func TestSegmentContent_ParagraphPerMessage(t *testing.T) {
+	cfg := model.BotConfig{TextSegmentationEnabled: true, TextSegmentationLimit: 300}
+	got := dispatchParts(t, "Olá! Seja muito bem-vindo(a) à INOVE! 😊\n\nVocê está dando um passo importante.\n\n\nComo posso te chamar?", cfg)
+	want := []string{"Olá! Seja muito bem-vindo(a) à INOVE! 😊", "Você está dando um passo importante.", "Como posso te chamar?"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestSegmentContent_KeepsLineBreaksInsideParagraph(t *testing.T) {
+	cfg := model.BotConfig{TextSegmentationEnabled: true, TextSegmentationLimit: 300}
+	got := dispatchParts(t, "É uma formação de 300 horas:\n✅ 240h online\n✅ 60h de estágio", cfg)
+	if len(got) != 1 || got[0] != "É uma formação de 300 horas:\n✅ 240h online\n✅ 60h de estágio" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestSegmentContent_LongParagraphSplitsOnSentences(t *testing.T) {
+	cfg := model.BotConfig{TextSegmentationEnabled: true, TextSegmentationLimit: 40}
+	got := dispatchParts(t, "A primeira frase é esta aqui. A segunda frase vem logo depois! E a terceira?", cfg)
+	want := []string{"A primeira frase é esta aqui.", "A segunda frase vem logo depois!", "E a terceira?"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
