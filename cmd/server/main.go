@@ -18,7 +18,9 @@ import (
 	aiService "github.com/EvolutionAPI/evo-bot-runtime/pkg/ai/service"
 	debounceService "github.com/EvolutionAPI/evo-bot-runtime/pkg/debounce/service"
 	dispatchService "github.com/EvolutionAPI/evo-bot-runtime/pkg/dispatch/service"
+	"github.com/EvolutionAPI/evo-bot-runtime/pkg/media"
 	pipelineHandler "github.com/EvolutionAPI/evo-bot-runtime/pkg/pipeline/handler"
+	"github.com/EvolutionAPI/evo-bot-runtime/pkg/pipeline/model"
 	"github.com/EvolutionAPI/evo-bot-runtime/pkg/pipeline/repository"
 	pipelineService "github.com/EvolutionAPI/evo-bot-runtime/pkg/pipeline/service"
 )
@@ -63,7 +65,10 @@ func main() {
 	}
 
 	// Step 9: handler + routes
-	handler := pipelineHandler.NewHandler(pipelineRepo, pipeline, cfg.BotRuntimeSecret)
+	// INOVE fork: media messages without text are transcribed (audio) or replaced
+	// by an instruction for the agent, so the lead always gets an answer.
+	enriched := &enrichingPipeline{PipelineService: pipeline, enricher: media.NewFromEnv()}
+	handler := pipelineHandler.NewHandler(pipelineRepo, enriched, cfg.BotRuntimeSecret)
 	r := gin.New()
 	r.Use(gin.Recovery())
 	handler.RegisterRoutes(r)
@@ -92,4 +97,15 @@ func main() {
 
 	// Step 13: stop pipeline (cancel in-flight goroutines, drain poller)
 	pipeline.Shutdown(shutdownCtx)
+}
+
+// enrichingPipeline fills empty message content before the normal pipeline runs.
+type enrichingPipeline struct {
+	pipelineService.PipelineService
+	enricher *media.Enricher
+}
+
+func (p *enrichingPipeline) Process(ctx context.Context, event *model.MessageEvent) error {
+	p.enricher.Enrich(ctx, event)
+	return p.PipelineService.Process(ctx, event)
 }
