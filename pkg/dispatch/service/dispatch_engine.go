@@ -1,6 +1,7 @@
 package service
 
 import (
+	"math/rand"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -50,6 +51,45 @@ type postbackAttachment struct {
 type dispatchEngineImpl struct {
 	client *http.Client
 	secret string
+	typist Typist
+}
+
+// Typist shows a "typing..." indicator to the lead (INOVE fork). Best effort.
+type Typist interface {
+	Typing(ctx context.Context, conversationID int64, on bool)
+}
+
+// NewDispatchEngineWithTypist is NewDispatchEngine plus a typing indicator and
+// human-like pacing: each part waits a typing time proportional to its own
+// length (with the indicator on) BEFORE it is sent.
+func NewDispatchEngineWithTypist(secret string, t Typist) DispatchEngine {
+	return &dispatchEngineImpl{
+		client: &http.Client{Timeout: postbackClientTimeout},
+		secret: secret,
+		typist: t,
+	}
+}
+
+const (
+	typingBase    = 600 * time.Millisecond
+	typingMin     = 1500 * time.Millisecond
+	typingMax     = 8 * time.Second
+	interPartMin  = 700 * time.Millisecond
+	interPartSpan = 800 * time.Millisecond
+)
+
+// typingDelay is how long a person would take to type part: base + perChar*len,
+// clamped and jittered ±15% so the rhythm does not look mechanical.
+func typingDelay(part string, perCharMs float64) time.Duration {
+	d := typingBase + time.Duration(perCharMs*float64(utf8.RuneCountInString(part)))*time.Millisecond
+	if d < typingMin {
+		d = typingMin
+	}
+	if d > typingMax {
+		d = typingMax
+	}
+	j := 0.85 + rand.Float64()*0.30
+	return time.Duration(float64(d) * j)
 }
 
 // postbackClientTimeout is the maximum time allowed for a single HTTP postback call.
@@ -107,12 +147,33 @@ func (d *dispatchEngineImpl) Dispatch(
 		default:
 		}
 
+		// INOVE fork: human pacing — pause, show "typing...", wait the time it
+		// would take to type THIS part, then send it.
+		if d.typist != nil && cfg.DelayPerCharacter > 0 {
+			wait := typingDelay(part, cfg.DelayPerCharacter)
+			if i > 0 {
+				wait += interPartMin + time.Duration(rand.Int63n(int64(interPartSpan)))
+			}
+			d.typist.Typing(ctx, conversationID, true)
+			select {
+			case <-ctx.Done():
+				d.typist.Typing(context.Background(), conversationID, false)
+				slog.Info("pipeline.dispatch.interrupted",
+					"contact_id",      contactID,
+					"conversation_id", conversationID,
+					"parts_sent",      i,
+				)
+				return brtErrors.ErrDispatchInterrupted
+			case <-time.After(wait):
+			}
+		}
+
 		if err := d.sendPart(ctx, postbackURL, part, nil); err != nil {
 			return fmt.Errorf("pipeline.dispatch.send[%d]: %w", i, err)
 		}
 
 		// Apply inter-part delay — skip for the last part (FR-22)
-		if i < len(parts)-1 && cfg.DelayPerCharacter > 0 {
+		if d.typist == nil && i < len(parts)-1 && cfg.DelayPerCharacter > 0 {
 			delayMs := time.Duration(cfg.DelayPerCharacter*float64(utf8.RuneCountInString(part))) * time.Millisecond
 			select {
 			case <-ctx.Done():

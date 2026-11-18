@@ -316,3 +316,41 @@ func TestSegmentContent_LongParagraphSplitsOnSentences(t *testing.T) {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
+
+type fakeTypist struct {
+	mu     sync.Mutex
+	events []bool
+}
+
+func (f *fakeTypist) Typing(_ context.Context, _ int64, on bool) {
+	f.mu.Lock()
+	f.events = append(f.events, on)
+	f.mu.Unlock()
+}
+
+func TestDispatch_TypistShowsTypingBeforeEachPart(t *testing.T) {
+	var mu sync.Mutex
+	sent := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		sent++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	ft := &fakeTypist{}
+	eng := service.NewDispatchEngineWithTypist("", ft)
+	cfg := model.BotConfig{TextSegmentationEnabled: true, TextSegmentationLimit: 300, DelayPerCharacter: 1}
+	start := time.Now()
+	if err := eng.Dispatch(context.Background(), 1, 1, "Oi!\n\nTudo bem?", cfg, server.URL); err != nil {
+		t.Fatal(err)
+	}
+	el := time.Since(start)
+	if sent != 2 || len(ft.events) != 2 || !ft.events[0] || !ft.events[1] {
+		t.Fatalf("sent=%d typing events=%v", sent, ft.events)
+	}
+	// 2 parts × ≥1.275s typing (min 1.5s −15%) + ≥0.7s gap
+	if el < 3200*time.Millisecond {
+		t.Errorf("dispatch too fast for human pacing: %v", el)
+	}
+}

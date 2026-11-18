@@ -19,6 +19,7 @@ import (
 	debounceService "github.com/EvolutionAPI/evo-bot-runtime/pkg/debounce/service"
 	dispatchService "github.com/EvolutionAPI/evo-bot-runtime/pkg/dispatch/service"
 	"github.com/EvolutionAPI/evo-bot-runtime/pkg/media"
+	"github.com/EvolutionAPI/evo-bot-runtime/pkg/presence"
 	pipelineHandler "github.com/EvolutionAPI/evo-bot-runtime/pkg/pipeline/handler"
 	"github.com/EvolutionAPI/evo-bot-runtime/pkg/pipeline/model"
 	"github.com/EvolutionAPI/evo-bot-runtime/pkg/pipeline/repository"
@@ -56,7 +57,14 @@ func main() {
 	aiAdapter := aiService.NewAIAdapter(cfg.AICallTimeoutSeconds)
 
 	// Step 7: dispatch engine (sends secret header on postback to CRM)
-	dispatch := dispatchService.NewDispatchEngine(cfg.BotRuntimeSecret)
+	// INOVE fork: "digitando..." + human pacing between message parts.
+	typist := presence.NewFromEnv()
+	var dispatch dispatchService.DispatchEngine
+	if typist != nil {
+		dispatch = dispatchService.NewDispatchEngineWithTypist(cfg.BotRuntimeSecret, typist)
+	} else {
+		dispatch = dispatchService.NewDispatchEngine(cfg.BotRuntimeSecret)
+	}
 
 	// Step 8: pipeline service
 	pipeline := pipelineService.NewPipelineService(pipelineRepo, debounce, aiAdapter, dispatch)
@@ -67,7 +75,7 @@ func main() {
 	// Step 9: handler + routes
 	// INOVE fork: media messages without text are transcribed (audio) or replaced
 	// by an instruction for the agent, so the lead always gets an answer.
-	enriched := &enrichingPipeline{PipelineService: pipeline, enricher: media.NewFromEnv()}
+	enriched := &enrichingPipeline{PipelineService: pipeline, enricher: media.NewFromEnv(), typist: typist}
 	handler := pipelineHandler.NewHandler(pipelineRepo, enriched, cfg.BotRuntimeSecret)
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -103,9 +111,11 @@ func main() {
 type enrichingPipeline struct {
 	pipelineService.PipelineService
 	enricher *media.Enricher
+	typist   *presence.Typist
 }
 
 func (p *enrichingPipeline) Process(ctx context.Context, event *model.MessageEvent) error {
+	p.typist.Remember(event.ConversationID, event.Metadata)
 	p.enricher.Enrich(ctx, event)
 	return p.PipelineService.Process(ctx, event)
 }
